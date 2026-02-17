@@ -1,0 +1,32 @@
+# Document RAG Server Requirements
+# Install with: pip install -r requirements-doc-rag.txt
+
+# MCP Server
+mcp>=1.0.0
+
+# Document Parsing
+unstructured[all-docs]>=0.12.0
+PyPDF2>=3.0.0
+python-docx>=1.1.0
+openpyxl>=3.1.0
+python-pptx>=0.6.21
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Vector Database & Embeddings
+lancedb>=0.5.0
+sentence-transformers>=2.2.0
+torch>=2.0.0
+pyarrow>=14.0.0
+
+# Text Processing
+langchain-text-splitters>=0.0.1
+
+# Hybrid Search
+rank-bm25>=0.2.2
+nltk>=3.8.0
+
+# Utilities
+tqdm>=4.65.0

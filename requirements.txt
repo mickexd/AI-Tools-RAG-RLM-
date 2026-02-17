@@ -1,0 +1,93 @@
+# Smart Context Manager - Complete Requirements
+# ============================================================
+# This file lists ALL dependencies needed for the complete system
+# 
+# Quick Install (Smart Context only):
+#   pip install mcp fastmcp requests numpy
+#
+# Full Install (includes Document RAG):
+#   pip install -r requirements.txt
+#
+# ============================================================
+
+# ============================================================
+# CORE DEPENDENCIES (Required for Smart Context MCP)
+# ============================================================
+
+# MCP Framework
+mcp>=1.0.0
+fastmcp>=0.4.0
+
+# HTTP client for Ollama API
+requests>=2.28.0
+
+# Numerical computing
+numpy>=1.24.0
+
+# ============================================================
+# DOCUMENT RAG DEPENDENCIES (Required for Document RAG Server)
+# ============================================================
+
+# Vector Database & Embeddings
+lancedb>=0.5.0
+sentence-transformers>=2.2.0
+torch>=2.0.0
+pyarrow>=14.0.0
+
+# Text Processing
+langchain-text-splitters>=0.0.1
+nltk>=3.8.0
+
+# Hybrid Search
+rank-bm25>=0.2.2
+
+# Document Parsing - Core
+unstructured>=0.12.0
+
+# Document Parsing - Specific formats
+PyPDF2>=3.0.0          # PDF files
+python-docx>=1.1.0     # Word documents
+openpyxl>=3.1.0        # Excel files
+python-pptx>=0.6.21    # PowerPoint files
+
+# Data Processing
+pandas>=2.0.0
+
+# Progress bars
+# tqdm>=4.65.0
+
+# ============================================================
+# OPTIONAL DEPENDENCIES (Enhanced document parsing)
+# ============================================================
+
+# For enhanced PDF/DOCX/Excel parsing with unstructured
+# Install with: pip install unstructured[all-docs]
+# This downloads additional models for better parsing
+
+# ============================================================
+# OLLAMA MODELS (Install separately with Ollama CLI)
+# ============================================================
+# After installing Ollama from https://ollama.com/, run:
+#
+#   ollama pull qwen3:14b
+#   ollama pull nomic-embed-text:latest
+#
+# These are large models (~10GB and ~2GB respectively)
+
+# ============================================================
+# TROUBLESHOOTING
+# ============================================================
+# 
+# ImportError: No module named 'X'
+#   → Run: pip install -r requirements.txt
+#
+# ModuleNotFoundError for specific file types
+#   → Install specific package:
+#   PDF issues: pip install PyPDF2
+#   Word issues: pip install python-docx
+#   Excel issues: pip install openpyxl
+#   PowerPoint issues: pip install python-pptx
+#
+# NLTK data missing
+#   → Python will auto-download on first run, or manually:
+#   import nltk; nltk.download('punkt')
