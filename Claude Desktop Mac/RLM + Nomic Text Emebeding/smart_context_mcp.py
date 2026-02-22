@@ -1,17 +1,17 @@
 """
-Smart Context MCP Server - HIGH PERFORMANCE VERSION
-Optimized for speed with connection pooling, caching, and async support.
+RLM REPL Server — MCP tools for the Recursive Language Model paradigm.
 
-Implements the Recursive Language Model (RLM) paradigm from:
-"Recursive Language Models" (Zhang, Kraska, Khattab - arXiv:2512.24601)
+Architecture: Claude (root LLM) orchestrates via MCP tool calls.
+Sub-LLM calls go to OpenRouter (Gemini 3 Flash) with LM Studio fallback (Qwen3 14B).
 
-Key optimizations:
-- Connection pooling via requests.Session()
-- LRU caching for LLM responses
-- Pre-compiled regex patterns
-- __slots__ for memory efficiency
-- Optimized string operations
-- Connection reuse across requests
+Based on "Recursive Language Models" (Zhang, Kraska, Khattab — arXiv:2512.24601).
+
+The key insight: Claude never sees the raw context. It lives as a REPL variable.
+Claude writes Python to inspect/chunk/process it, delegating heavy lifting to sub-LLMs.
+Each REPL result returns only metadata (variable names, truncated stdout) to keep
+Claude's context window clean — enabling dozens of iterations instead of 1-2.
+
+Mac-compatible version with proper path resolution for macOS.
 """
 
 import io
@@ -19,1031 +19,741 @@ import json
 import os
 import re
 import sys
+import shutil
 import tempfile
 import threading
 import time
-import shutil
-from collections import deque
+import concurrent.futures
 from dataclasses import dataclass, field
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urljoin
 
 import requests
 from mcp.server.fastmcp import FastMCP
 
-# ============================================================================
-# OPTIMIZATION: Pre-compiled regex patterns (avoid recompilation)
-# ============================================================================
 
-# Code block extraction - compiled once
-REPL_CODE_PATTERN = re.compile(r"```repl\s*\n(.*?)\n```", re.DOTALL)
-
-# Final answer patterns - more restrictive to avoid capturing markdown
-# Only matches valid Python identifiers: letters, digits, underscore
-FINAL_VAR_PATTERN = re.compile(r"^\s*FINAL_VAR\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)", re.MULTILINE)
-FINAL_PATTERN = re.compile(r"^\s*FINAL\((.*?)\)", re.MULTILINE | re.DOTALL)
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+# ─── Configuration ────────────────────────────────────────────────────────────
 
 class Config:
-    OLLAMA_BASE_URL = "http://localhost:11434"
-    LLM_MODEL = "ministral-3:latest"
+    # Primary sub-LLM: OpenRouter → Gemini 2.5 Flash
+    OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+    OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "YOUR API HERE")
+    OPENROUTER_MODEL = os.environ.get("RLM_SUB_MODEL", "google/gemini-3-flash-preview")
 
-    # Context window sizes
-    ROOT_NUM_CTX = 32768
-    SUB_LLM_NUM_CTX = 24576
+    # Fallback sub-LLM: LM Studio → Qwen3 14B (local)
+    LMSTUDIO_BASE_URL = os.environ.get("LMSTUDIO_BASE_URL", "http://localhost:1234/v1")
+    LMSTUDIO_MODEL = os.environ.get("LMSTUDIO_MODEL", "qwen/qwen3-14b")
 
-    # RLM loop limits
-    MAX_ITERATIONS = 30
-    MAX_MESSAGE_HISTORY = 20
+    # Sub-LLM parameters
+    SUB_LLM_TEMPERATURE = 0.3
+    SUB_LLM_MAX_TOKENS = 16384
+    SUB_LLM_TIMEOUT = 120
 
-    # Max chars per REPL output message fed back to root LLM
-    MAX_RESULT_LENGTH = 100000
+    # REPL output limits — Algorithm 1 requires bounded turn size
+    # "if we trim each turn to c tokens, we will have at most K/c root iterations"
+    STDOUT_PREVIEW_CHARS = 500
+    STDERR_PREVIEW_CHARS = 300
+    MAX_BATCH_WORKERS = 8
 
-    # File handling
-    MIN_CHUNK_SIZE = 100
-    MAX_CHUNK_SIZE = 500000
-    DEFAULT_TIMEOUT = 300  # 5 minutes
-
-    # Performance: Cache settings
-    LLM_CACHE_SIZE = 128  # Cache last 128 LLM responses
-    LLM_CACHE_TTL = 3600  # Cache TTL in seconds (1 hour)
-
-
-# ============================================================================
-# OPTIMIZATION: Data classes with __slots__ for memory efficiency
-# ============================================================================
-
-@dataclass(slots=True)
-class REPLResult:
-    """Result from executing code in REPL environment"""
-    stdout: str
-    stderr: str
-    locals: dict
-    execution_time: float = 0.0
+    # File reading
+    DEFAULT_ENCODING = "utf-8"
+    FALLBACK_ENCODING = "latin-1"
 
 
-@dataclass(slots=True)
-class RLMIteration:
-    """Single iteration of RLM execution loop"""
-    prompt: str
-    response: str
-    code_blocks: list
-    final_answer: str = None
-    iteration_time: float = None
+# ─── Sub-LLM Client ──────────────────────────────────────────────────────────
+# Two-tier: OpenRouter (primary) → LM Studio (fallback)
+# No caching — each sub-call processes unique context (paper design).
+
+class SubLLMClient:
+    """
+    Manages sub-LLM calls with automatic failover.
+    Primary: OpenRouter API (Gemini 2.5 Flash — 1M context, fast, cheap).
+    Fallback: LM Studio local server (Qwen3 14B — no API cost, offline capable).
+    """
+
+    def __init__(self):
+        self._session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=10, pool_maxsize=20, max_retries=2
+        )
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
+
+        self._openrouter_ok: Optional[bool] = None
+        self._lmstudio_ok: Optional[bool] = None
+        self._lock = threading.Lock()
+        self._call_count = 0
+        self._total_input_chars = 0
+        self._total_output_chars = 0
+
+    def _check_openrouter(self) -> bool:
+        if not Config.OPENROUTER_API_KEY:
+            return False
+        try:
+            resp = self._session.get(
+                f"{Config.OPENROUTER_BASE_URL}/models",
+                headers={"Authorization": f"Bearer {Config.OPENROUTER_API_KEY}"},
+                timeout=5,
+            )
+            return resp.status_code == 200
+        except requests.RequestException:
+            return False
+
+    def _check_lmstudio(self) -> bool:
+        try:
+            resp = self._session.get(
+                f"{Config.LMSTUDIO_BASE_URL}/models", timeout=3
+            )
+            return resp.status_code == 200
+        except requests.RequestException:
+            return False
+
+    def health_check(self) -> dict:
+        """Check availability of both backends."""
+        self._openrouter_ok = self._check_openrouter()
+        self._lmstudio_ok = self._check_lmstudio()
+        return {
+            "openrouter": {
+                "available": self._openrouter_ok,
+                "model": Config.OPENROUTER_MODEL,
+            },
+            "lmstudio": {
+                "available": self._lmstudio_ok,
+                "model": Config.LMSTUDIO_MODEL,
+                "url": Config.LMSTUDIO_BASE_URL,
+            },
+            "active_backend": self._resolve_backend_name(),
+        }
+
+    def _resolve_backend_name(self) -> str:
+        if self._openrouter_ok is None:
+            self._openrouter_ok = self._check_openrouter()
+        if self._openrouter_ok:
+            return "openrouter"
+        if self._lmstudio_ok is None:
+            self._lmstudio_ok = self._check_lmstudio()
+        if self._lmstudio_ok:
+            return "lmstudio"
+        return "none"
+
+    def _call_openrouter(self, prompt: str) -> str:
+        resp = self._session.post(
+            f"{Config.OPENROUTER_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {Config.OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": Config.OPENROUTER_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": Config.SUB_LLM_TEMPERATURE,
+                "max_tokens": Config.SUB_LLM_MAX_TOKENS,
+            },
+            timeout=Config.SUB_LLM_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
+
+    def _call_lmstudio(self, prompt: str) -> str:
+        resp = self._session.post(
+            f"{Config.LMSTUDIO_BASE_URL}/chat/completions",
+            headers={"Content-Type": "application/json"},
+            json={
+                "model": Config.LMSTUDIO_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": Config.SUB_LLM_TEMPERATURE,
+                "max_tokens": Config.SUB_LLM_MAX_TOKENS,
+            },
+            timeout=Config.SUB_LLM_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
+
+    def query(self, prompt: str) -> str:
+        """
+        Single sub-LLM call with automatic failover.
+        Returns the response text or an error string.
+        """
+        # Try OpenRouter first
+        if self._openrouter_ok is None:
+            self._openrouter_ok = self._check_openrouter()
+
+        if self._openrouter_ok:
+            try:
+                result = self._call_openrouter(prompt)
+                self._track(prompt, result)
+                return result
+            except Exception as e:
+                self._openrouter_ok = False  # Mark down, try fallback
+
+        # Fallback to LM Studio
+        if self._lmstudio_ok is None:
+            self._lmstudio_ok = self._check_lmstudio()
+
+        if self._lmstudio_ok:
+            try:
+                result = self._call_lmstudio(prompt)
+                self._track(prompt, result)
+                return result
+            except Exception as e:
+                self._lmstudio_ok = False
+                return f"[SUB-LLM ERROR] Both backends failed. LM Studio: {e}"
+
+        return "[SUB-LLM ERROR] No backends available. Set OPENROUTER_API_KEY or start LM Studio."
+
+    def query_batch(self, prompts: list[str]) -> list[str]:
+        """
+        Parallel sub-LLM calls. Respects MAX_BATCH_WORKERS concurrency limit.
+        """
+        if not prompts:
+            return []
+
+        workers = min(len(prompts), Config.MAX_BATCH_WORKERS)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(self.query, p) for p in prompts]
+            return [f.result() for f in futures]
+
+    def _track(self, prompt: str, result: str):
+        with self._lock:
+            self._call_count += 1
+            self._total_input_chars += len(prompt)
+            self._total_output_chars += len(result)
+
+    @property
+    def stats(self) -> dict:
+        with self._lock:
+            return {
+                "calls": self._call_count,
+                "input_chars": self._total_input_chars,
+                "output_chars": self._total_output_chars,
+            }
+
+    def reset_stats(self):
+        with self._lock:
+            self._call_count = 0
+            self._total_input_chars = 0
+            self._total_output_chars = 0
+
+    def close(self):
+        self._session.close()
 
 
-# ============================================================================
-# SAFE BUILTINS FOR REPL
-# ============================================================================
+# ─── REPL Environment ─────────────────────────────────────────────────────────
+# Sandboxed Python execution with proper namespace handling.
+# Follows reference implementation: imports in globals, auto-print last expression.
 
 _SAFE_BUILTINS = {
-    "len": len,
-    "range": range,
-    "enumerate": enumerate,
-    "zip": zip,
-    "map": map,
-    "filter": filter,
-    "sum": sum,
-    "min": min,
-    "max": max,
-    "abs": abs,
-    "round": round,
-    "int": int,
-    "float": float,
-    "str": str,
-    "bool": bool,
-    "list": list,
-    "dict": dict,
-    "set": set,
-    "tuple": tuple,
-    "sorted": sorted,
-    "reversed": reversed,
-    "any": any,
-    "all": all,
-    "print": print,
-    "type": type,
-    "isinstance": isinstance,
-    "hasattr": hasattr,
-    "getattr": getattr,
-    "setattr": setattr,
-    "issubclass": issubclass,
-    "slice": slice,
-    "next": next,
-    "iter": iter,
-    "divmod": divmod,
-    "pow": pow,
-    "chr": chr,
-    "ord": ord,
-    "hex": hex,
-    "bin": bin,
-    "oct": oct,
-    "format": format,
-    "repr": repr,
-    "vars": vars,
-    "dir": dir,
-    "help": help,
-    "open": open,
-    "json": json,
-    "re": re,
+    # Core types
+    "int": int, "float": float, "str": str, "bool": bool, "bytes": bytes,
+    "list": list, "dict": dict, "set": set, "tuple": tuple, "complex": complex,
+    "bytearray": bytearray, "frozenset": frozenset, "type": type, "object": object,
+    # Iteration & functional
+    "range": range, "enumerate": enumerate, "zip": zip, "map": map, "filter": filter,
+    "sorted": sorted, "reversed": reversed, "iter": iter, "next": next,
+    "any": any, "all": all, "slice": slice,
+    # Math
+    "len": len, "sum": sum, "min": min, "max": max, "abs": abs, "round": round,
+    "pow": pow, "divmod": divmod,
+    # String & repr
+    "chr": chr, "ord": ord, "hex": hex, "bin": bin, "oct": oct,
+    "format": format, "repr": repr, "ascii": ascii, "hash": hash,
+    # Attribute access
+    "isinstance": isinstance, "issubclass": issubclass,
+    "hasattr": hasattr, "getattr": getattr, "setattr": setattr, "delattr": delattr,
+    "dir": dir, "vars": vars, "callable": callable, "id": id,
+    # I/O
+    "print": print, "open": open, "input": None,
+    # Imports allowed
+    "__import__": __import__,
+    # Common exceptions
+    "Exception": Exception, "ValueError": ValueError, "TypeError": TypeError,
+    "KeyError": KeyError, "IndexError": IndexError, "AttributeError": AttributeError,
+    "FileNotFoundError": FileNotFoundError, "RuntimeError": RuntimeError,
+    "StopIteration": StopIteration, "ImportError": ImportError,
+    "OSError": OSError, "IOError": IOError, "NameError": NameError,
+    "NotImplementedError": NotImplementedError, "ZeroDivisionError": ZeroDivisionError,
+    # Block dangerous builtins
+    "eval": None, "exec": None, "compile": None, "globals": None, "locals": None,
 }
 
 
-# ============================================================================
-# SYSTEM PROMPT (RLM paradigm from paper)
-# ============================================================================
-
-RLM_SYSTEM_PROMPT = """You are a Recursive Language Model (RLM) with access to a Python REPL environment.
-
-CRITICAL: The context variable contains your working data. It can be VERY LARGE (millions of lines). You CANNOT see it directly — you MUST write Python code to inspect it.
-
-Available REPL commands:
-- Write Python code in ```repl blocks to execute
-- Use FINAL_VAR(variable_name) to return a variable's value as the answer
-- Use FINAL(answer text) to provide a direct text answer
-- Use llm_query(prompt) to query a sub-LLM with a prompt (returns response string)
-- Use llm_query_batched([prompts]) to query sub-LLM with multiple prompts in parallel
-- Use SHOW_VARS() to see available variables
-
-PARADIGM (from research paper):
-1. The context is loaded as a REPL variable — it's NEVER fed to you directly
-2. You write Python code to inspect, slice, and process the context
-3. For large contexts, process them in chunks using sub-LLM calls
-4. Build up your answer incrementally in REPL variables
-5. When ready, use FINAL_VAR or FINAL to provide the answer
-
-EXAMPLE workflow:
-```repl
-# First, inspect the context structure
-sample = context[:1000]
-print(sample)
-```
-
-```repl
-# Process large context in chunks using sub-LLM
-chunks = [context[i:i+5000] for i in range(0, len(context), 5000)]
-prompts = [f"Extract key info from: {chunk}" for chunk in chunks]
-results = llm_query_batched(prompts)
-combined = "\n".join(results)
-```
-
-```repl
-# Store result and finalize
-FINAL_VAR(combined)
-```
-
-Be concise in your reasoning. Focus on writing working Python code."""
-
-
-# ============================================================================
-# OPTIMIZED REPL ENVIRONMENT
-# ============================================================================
-
 class REPLEnvironment:
     """
-    Sandboxed Python REPL implementing the RLM environment.
-    Optimized with better memory management and faster execution.
+    Sandboxed Python REPL that persists across tool calls within a session.
+
+    Key design choices from the paper:
+    - Imports execute in globals (available to all subsequent code)
+    - Auto-prints the last expression (like Jupyter/IPython)
+    - Returns metadata only: variable names + truncated stdout
     """
 
-    __slots__ = ['ollama_client', '_lock', '_pending_llm_calls', 'temp_dir', 
-                 'context_file_path', 'globals', 'locals', '_session']
-
-    def __init__(self, context: Any, ollama_client, use_temp_file: bool = None):
-        self.ollama_client = ollama_client
+    def __init__(self, sub_llm: SubLLMClient):
+        self._sub_llm = sub_llm
         self._lock = threading.Lock()
-        self._pending_llm_calls = []
+        self._temp_dir = tempfile.mkdtemp(prefix="rlm_repl_")
 
-        # Create temp directory for large contexts
-        self.temp_dir = tempfile.mkdtemp(prefix="rlm_repl_")
-        self.context_file_path = None
+        # Separate namespaces — avoids the globals/locals collision bug
+        self._globals = {"__builtins__": _SAFE_BUILTINS.copy(), "__name__": "__repl__"}
+        self._locals = {}
 
-        # Auto-detect whether to use temp file (>100KB)
-        context_size = len(context) if isinstance(context, (str, bytes)) else len(str(context))
-        if use_temp_file is None:
-            use_temp_file = context_size > 100000
+        # Inject RLM functions
+        self._globals["llm_query"] = self._llm_query
+        self._globals["llm_query_batched"] = self._llm_query_batched
 
-        # Sandboxed namespace
-        self.globals = {"__builtins__": _SAFE_BUILTINS.copy(), "__name__": "__main__"}
-        self.locals = {}
+    # ── Context loading ──
 
-        # Load context (via temp file for large contexts, directly for small)
-        self._load_context(context, use_temp_file)
-
-        # Add RLM functions to REPL namespace
-        self.globals["FINAL_VAR"] = self._final_var
-        self.globals["SHOW_VARS"] = self._show_vars
-        self.globals["llm_query"] = self._llm_query
-        self.globals["llm_query_batched"] = self._llm_query_batched
-
-    def _load_context(self, context: Any, use_temp_file: bool):
-        """Load context into REPL with optimized handling."""
-        if isinstance(context, str) and use_temp_file:
-            # OPTIMIZATION: Write large string to temp file
-            self.context_file_path = os.path.join(self.temp_dir, "context.txt")
-            with open(self.context_file_path, "w", encoding="utf-8") as f:
-                f.write(context)
-            # Load via REPL code execution
-            load_code = (
-                f"with open(r'{self.context_file_path}', 'r', encoding='utf-8') as f:\n"
-                f"    context = f.read()\n"
+    def load_string(self, content: str, var_name: str = "context"):
+        """Load a string into the REPL as a variable."""
+        if len(content) > 100_000:
+            # Large content: write to temp file, read back in REPL
+            path = os.path.join(self._temp_dir, f"{var_name}.txt")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            self.execute(
+                f"with open(r'{path}', 'r', encoding='utf-8') as _f:\n"
+                f"    {var_name} = _f.read()"
             )
-            self.execute_code(load_code)
-        elif isinstance(context, (dict, list)) and use_temp_file:
-            # Write JSON to temp file
-            self.context_file_path = os.path.join(self.temp_dir, "context.json")
-            with open(self.context_file_path, "w", encoding="utf-8") as f:
-                json.dump(context, f, indent=2)
-            # Load via REPL code execution
-            load_code = (
-                f"import json\n"
-                f"with open(r'{self.context_file_path}', 'r', encoding='utf-8') as f:\n"
-                f"    context = json.load(f)\n"
-            )
-            self.execute_code(load_code)
         else:
-            # Direct assignment for small contexts
-            self.locals["context"] = context
+            self._locals[var_name] = content
 
-    def __del__(self):
-        """Clean up temp directory"""
-        try:
-            shutil.rmtree(self.temp_dir, ignore_errors=True)
-        except Exception:
-            pass
-
-    def _final_var(self, variable_name: str) -> str:
-        """Return variable value as final answer"""
-        variable_name = variable_name.strip()
-        if variable_name in self.locals:
-            return str(self.locals[variable_name])
-        available = [k for k in self.locals.keys() if not k.startswith("_")]
-        return f"Error: Variable '{variable_name}' not found. Available: {available}"
-
-    def _show_vars(self) -> str:
-        """Show all variables in REPL"""
-        available = {
-            k: type(v).__name__ for k, v in self.locals.items() if not k.startswith("_")
-        }
-        return f"Available variables: {available}" if available else "No variables yet"
-
-    def _llm_query(self, prompt: str, model: str = None) -> str:
-        """
-        Sub-LLM call with caching for repeated queries.
-        """
-        start_time = time.perf_counter()
-        try:
-            # OPTIMIZATION: Use cached response if available
-            cache_key = f"{model or Config.LLM_MODEL}:{hash(prompt) & 0xFFFFFF}"
-            cached = _get_cached_llm_response(cache_key)
-            if cached:
-                return cached
-
-            messages = [{"role": "user", "content": prompt}]
-            result = self.ollama_client.chat(
-                messages,
-                model=model or Config.LLM_MODEL,
-                options={"temperature": 0.7, "num_ctx": Config.SUB_LLM_NUM_CTX},
+    def load_json(self, data: Any, var_name: str = "context"):
+        """Load JSON-serializable data into the REPL."""
+        serialized = json.dumps(data)
+        if len(serialized) > 100_000:
+            path = os.path.join(self._temp_dir, f"{var_name}.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            self.execute(
+                f"import json\n"
+                f"with open(r'{path}', 'r') as _f:\n"
+                f"    {var_name} = json.load(_f)"
             )
-            response = result.get("response", "")
-            
-            # Cache the response
-            _cache_llm_response(cache_key, response)
-            
-            self._pending_llm_calls.append({
-                "prompt_len": len(prompt),
-                "response_len": len(response),
-                "time": time.perf_counter() - start_time,
-            })
-            return response
-        except Exception as e:
-            return f"Error: LLM query failed - {str(e)}"
+        else:
+            self._locals[var_name] = data
 
-    def _llm_query_batched(self, prompts: list, model: str = None) -> list:
+    # ── Code execution ──
+
+    def execute(self, code: str) -> dict:
         """
-        Batched sub-LLM calls with optimized thread pool.
+        Execute Python code and return metadata-only result.
+
+        Returns dict with: stdout_preview, stderr, variables, execution_time.
+        Per Algorithm 1: "this forces M to rely on variables and sub-calls to manage
+        long strings instead of polluting its window."
         """
-        import concurrent.futures
-
-        def query_single(prompt):
-            # Check cache first
-            cache_key = f"{model or Config.LLM_MODEL}:{hash(prompt) & 0xFFFFFF}"
-            cached = _get_cached_llm_response(cache_key)
-            if cached:
-                return cached
-
-            messages = [{"role": "user", "content": prompt}]
-            result = self.ollama_client.chat(
-                messages,
-                model=model or Config.LLM_MODEL,
-                options={"temperature": 0.7, "num_ctx": Config.SUB_LLM_NUM_CTX},
-            )
-            response = result.get("response", "")
-            _cache_llm_response(cache_key, response)
-            return response
-
-        try:
-            # OPTIMIZATION: Use max_workers based on actual CPU cores
-            max_workers = min(len(prompts), 8)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [executor.submit(query_single, p) for p in prompts]
-                results = [f.result() for f in futures]
-            return results
-        except Exception as e:
-            return [f"Error: Batched query failed - {str(e)}"] * len(prompts)
-
-    def execute_code(self, code: str) -> REPLResult:
-        """
-        Execute Python code in sandboxed REPL environment.
-        Optimized for speed with reduced overhead.
-        """
-        start_time = time.perf_counter()
+        start = time.perf_counter()
         stdout_buf = io.StringIO()
         stderr_buf = io.StringIO()
 
         with self._lock:
-            old_stdout, old_stderr = sys.stdout, sys.stderr
+            old_out, old_err = sys.stdout, sys.stderr
             try:
                 sys.stdout, sys.stderr = stdout_buf, stderr_buf
-                combined = {**self.globals, **self.locals}
-                exec(code, combined, combined)
 
-                # Update locals with any new variables created
-                for key, value in combined.items():
-                    if key not in self.globals and not key.startswith("_"):
-                        self.locals[key] = value
+                lines = code.split("\n")
+                import_lines = []
+                other_lines = []
+                for line in lines:
+                    stripped = line.strip()
+                    if stripped.startswith(("import ", "from ")) and not stripped.startswith("#"):
+                        import_lines.append(line)
+                    else:
+                        other_lines.append(line)
 
-                stdout = stdout_buf.getvalue()
-                stderr = stderr_buf.getvalue()
+                # Imports go to globals (available in all future executions)
+                if import_lines:
+                    exec("\n".join(import_lines), self._globals)
+
+                if other_lines:
+                    other_code = "\n".join(other_lines)
+                    combined = {**self._globals, **self._locals}
+
+                    # Auto-print last expression (like Jupyter)
+                    non_empty = [l for l in other_lines if l.strip() and not l.strip().startswith("#")]
+                    did_auto_print = False
+
+                    if non_empty:
+                        last = non_empty[-1].strip()
+                        is_expr = (
+                            not last.startswith(("import ", "from ", "def ", "class ", "if ",
+                                                 "for ", "while ", "try:", "with ", "return ",
+                                                 "yield ", "break", "continue", "pass", "raise ",
+                                                 "del ", "assert ", "elif ", "else:", "except",
+                                                 "finally:", "print("))
+                            and "=" not in last.split("#")[0]
+                            and not last.endswith(":")
+                        )
+                        if is_expr:
+                            try:
+                                # Execute everything except last line as statements
+                                last_idx = None
+                                for i in range(len(other_lines) - 1, -1, -1):
+                                    if other_lines[i].strip() == last:
+                                        last_idx = i
+                                        break
+                                if last_idx and last_idx > 0:
+                                    exec("\n".join(other_lines[:last_idx]), combined, combined)
+                                val = eval(last, combined, combined)
+                                if val is not None:
+                                    print(repr(val))
+                                did_auto_print = True
+                            except Exception:
+                                did_auto_print = False
+
+                    if not did_auto_print:
+                        exec(other_code, combined, combined)
+
+                    # Update locals with new/changed variables
+                    for k, v in combined.items():
+                        if k not in self._globals and not k.startswith("_"):
+                            self._locals[k] = v
+
             except Exception as e:
-                stdout = stdout_buf.getvalue()
-                stderr = stderr_buf.getvalue() + f"\n{type(e).__name__}: {e}"
+                print(f"{type(e).__name__}: {e}", file=sys.stderr)
             finally:
-                sys.stdout, sys.stderr = old_stdout, old_stderr
+                sys.stdout, sys.stderr = old_out, old_err
 
-        return REPLResult(
-            stdout=stdout,
-            stderr=stderr,
-            locals=self.locals.copy(),
-            execution_time=time.perf_counter() - start_time,
-        )
+        elapsed = time.perf_counter() - start
+        raw_stdout = stdout_buf.getvalue()
+        raw_stderr = stderr_buf.getvalue()
+
+        # Build metadata-only response (Algorithm 1)
+        var_info = {}
+        for k, v in self._locals.items():
+            if k.startswith("_"):
+                continue
+            try:
+                vtype = type(v).__name__
+                if isinstance(v, str):
+                    vlen = f"{len(v):,} chars"
+                elif isinstance(v, (list, dict, tuple, set)):
+                    vlen = f"{len(v):,} items"
+                else:
+                    vlen = None
+                var_info[k] = {"type": vtype, "size": vlen} if vlen else {"type": vtype}
+            except Exception:
+                var_info[k] = {"type": "unknown"}
+
+        return {
+            "stdout": _truncate(raw_stdout, Config.STDOUT_PREVIEW_CHARS),
+            "stdout_full_length": len(raw_stdout),
+            "stderr": _truncate(raw_stderr, Config.STDERR_PREVIEW_CHARS) if raw_stderr else None,
+            "variables": var_info,
+            "execution_time_ms": round(elapsed * 1000, 1),
+        }
+
+    # ── Sub-LLM bridge ──
+
+    def _llm_query(self, prompt: str) -> str:
+        """Available inside REPL as llm_query(prompt)."""
+        return self._sub_llm.query(prompt)
+
+    def _llm_query_batched(self, prompts: list) -> list:
+        """Available inside REPL as llm_query_batched([prompts])."""
+        return self._sub_llm.query_batch(prompts)
+
+    # ── Variable access ──
+
+    def get_var(self, name: str) -> Any:
+        name = name.strip().strip("'\"")
+        if name in self._locals:
+            return self._locals[name]
+        raise KeyError(f"Variable '{name}' not found. Available: {self.var_names}")
+
+    @property
+    def var_names(self) -> list[str]:
+        return [k for k in self._locals if not k.startswith("_")]
+
+    # ── Cleanup ──
+
+    def destroy(self):
+        try:
+            shutil.rmtree(self._temp_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
-# ============================================================================
-# OPTIMIZED CODE PARSING
-# ============================================================================
+# ─── Session Manager ──────────────────────────────────────────────────────────
+# Single active session. Resets when a new context is loaded.
 
-def find_code_blocks(text: str) -> list:
-    """Extract ```repl code blocks using pre-compiled regex."""
-    return [match.group(1).strip() for match in REPL_CODE_PATTERN.finditer(text)]
-
-
-def find_final_answer(text: str, repl_env: REPLEnvironment = None) -> str | None:
+class Session:
     """
-    Find FINAL(...) or FINAL_VAR(...) in response.
-    
-    OPTIMIZATION: Uses pre-compiled regex with stricter patterns.
-    Only matches valid Python identifiers for FINAL_VAR.
+    Holds the active REPL environment and sub-LLM client.
+    One session at a time — loading new context resets it.
     """
-    # Check for FINAL_VAR first — must be valid Python identifier
-    match = FINAL_VAR_PATTERN.search(text)
-    if match:
-        variable_name = match.group(1)
-        if repl_env is not None:
-            if variable_name in repl_env.locals:
-                return str(repl_env.locals[variable_name])
-            else:
-                available = [k for k in repl_env.locals.keys() if not k.startswith("_")]
-                return f"Error: Variable '{variable_name}' not found. Available: {available}"
-        return None
 
-    # Check for FINAL — captures everything up to newline or end
-    match = FINAL_PATTERN.search(text)
-    if match:
-        return match.group(1).strip()
+    def __init__(self):
+        self.sub_llm = SubLLMClient()
+        self.repl: Optional[REPLEnvironment] = None
+        self.context_info: Optional[dict] = None
+        self._created_at: Optional[float] = None
 
-    return None
+    def init_repl(self, context: Any, context_type: str = "text") -> dict:
+        """Initialize or reset the REPL with new context."""
+        if self.repl:
+            self.repl.destroy()
+        self.sub_llm.reset_stats()
 
+        self.repl = REPLEnvironment(self.sub_llm)
+        self._created_at = time.time()
 
-def format_execution_result(result: REPLResult, max_length: int = None) -> str:
-    """
-    Format REPL result for display with optimized string building.
-    
-    OPTIMIZATION: Uses list append and join instead of concatenation.
-    """
-    if max_length is None:
-        max_length = Config.MAX_RESULT_LENGTH
+        if isinstance(context, str):
+            self.repl.load_string(context)
+            size_desc = f"{len(context):,} chars"
+        elif isinstance(context, (dict, list)):
+            self.repl.load_json(context)
+            size_desc = f"{len(json.dumps(context)):,} chars (serialized)"
+        else:
+            self.repl.load_string(str(context))
+            size_desc = f"{len(str(context)):,} chars"
 
-    parts = []
+        self.context_info = {
+            "context_type": context_type,
+            "size": size_desc,
+            "variables": self.repl.var_names,
+        }
+        return self.context_info
 
-    if result.stdout:
-        stdout = result.stdout
-        if len(stdout) > max_length:
-            stdout = stdout[:max_length] + f"... [{len(stdout) - max_length} chars truncated]"
-        parts.append("Output:\n")
-        parts.append(stdout)
+    @property
+    def is_active(self) -> bool:
+        return self.repl is not None
 
-    if result.stderr:
-        stderr = result.stderr
-        if len(stderr) > max_length:
-            stderr = stderr[:max_length] + f"... [{len(stderr) - max_length} chars truncated]"
-        if parts:
-            parts.append("\n\n")
-        parts.append("Errors:\n")
-        parts.append(stderr)
-
-    vars_list = [k for k in result.locals.keys() if not k.startswith("_")]
-    if vars_list:
-        if parts:
-            parts.append("\n\n")
-        parts.append(f"Variables: {vars_list}")
-
-    return "".join(parts) if parts else "No output"
+    @property
+    def status(self) -> dict:
+        if not self.is_active:
+            return {"active": False}
+        return {
+            "active": True,
+            "context": self.context_info,
+            "variables": self.repl.var_names if self.repl else [],
+            "sub_llm_stats": self.sub_llm.stats,
+            "uptime_seconds": round(time.time() - self._created_at, 1) if self._created_at else 0,
+        }
 
 
-# ============================================================================
-# OPTIMIZED MESSAGE HISTORY MANAGEMENT
-# ============================================================================
+# ─── Utilities ────────────────────────────────────────────────────────────────
 
-def _manage_message_history(message_history: list, max_messages: int = None) -> list:
-    """
-    Apply sliding window to message history using deque for O(1) operations.
-    
-    OPTIMIZATION: Uses deque instead of list slicing for better performance.
-    """
-    if max_messages is None:
-        max_messages = Config.MAX_MESSAGE_HISTORY
-    
-    # Always keep system prompt (index 0) and context metadata (index 1)
-    if len(message_history) <= max_messages + 2:
-        return message_history
-    
-    # Keep: [system, context_metadata, recent_messages]
-    kept_messages = message_history[:2] + message_history[-(max_messages - 2):]
-    return kept_messages
+def _truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n... [{len(text) - limit:,} more chars — use print(var) or slicing to inspect]"
 
 
-# ============================================================================
-# LLM RESPONSE CACHE
-# ============================================================================
+def _read_file(path: str) -> tuple[str, str]:
+    """Read file content with encoding fallback. Returns (content, detected_encoding)."""
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+    if not p.is_file():
+        raise ValueError(f"Not a file: {path}")
 
-_llm_cache = {}
-_llm_cache_timestamps = {}
-_cache_lock = threading.Lock()
-
-
-def _get_cached_llm_response(key: str) -> Optional[str]:
-    """Get cached LLM response if not expired."""
-    with _cache_lock:
-        if key in _llm_cache:
-            timestamp = _llm_cache_timestamps.get(key, 0)
-            if time.time() - timestamp < Config.LLM_CACHE_TTL:
-                return _llm_cache[key]
-            else:
-                # Expired, remove from cache
-                del _llm_cache[key]
-                del _llm_cache_timestamps[key]
-    return None
+    for enc in (Config.DEFAULT_ENCODING, Config.FALLBACK_ENCODING):
+        try:
+            return p.read_text(encoding=enc), enc
+        except UnicodeDecodeError:
+            continue
+    raise IOError(f"Cannot decode file: {path}")
 
 
-def _cache_llm_response(key: str, response: str):
-    """Cache LLM response with TTL."""
-    with _cache_lock:
-        # Simple LRU: if cache is full, clear oldest entries
-        if len(_llm_cache) >= Config.LLM_CACHE_SIZE:
-            # Remove oldest 25% of entries
-            sorted_keys = sorted(_llm_cache_timestamps.keys(), 
-                                key=lambda k: _llm_cache_timestamps[k])
-            for old_key in sorted_keys[:Config.LLM_CACHE_SIZE // 4]:
-                del _llm_cache[old_key]
-                del _llm_cache_timestamps[old_key]
-        
-        _llm_cache[key] = response
-        _llm_cache_timestamps[key] = time.time()
+def _resolve_path(filename: str) -> Path:
+    """Resolve file path with cross-platform search (macOS-optimized)."""
+    p = Path(filename)
+    if p.is_absolute() and p.exists():
+        return p
 
-
-def clear_llm_cache():
-    """Clear the LLM response cache."""
-    with _cache_lock:
-        _llm_cache.clear()
-        _llm_cache_timestamps.clear()
-
-
-# ============================================================================
-# OPTIMIZED RLM COMPLETION LOOP
-# ============================================================================
-
-def rlm_completion_loop(
-    query: str,
-    context: Any,
-    ollama_client,
-    max_iterations: int = None,
-    verbose: bool = False,
-) -> dict:
-    """
-    Main RLM execution loop with performance optimizations.
-    """
-    if max_iterations is None:
-        max_iterations = Config.MAX_ITERATIONS
-
-    start_time = time.perf_counter()
-    
-    # Initialize REPL environment
-    repl_env = REPLEnvironment(context, ollama_client)
-    
-    # Build initial message history
-    context_type = type(context).__name__
-    context_size = len(context) if isinstance(context, (str, bytes)) else len(str(context))
-    context_info = f"Context type: {context_type}, Size: {context_size:,} chars"
-    
-    message_history = [
-        {"role": "system", "content": RLM_SYSTEM_PROMPT},
-        {"role": "assistant", "content": f"Your context is available as the `context` variable in the REPL. {context_info}. You have NOT seen the content yet — use the REPL to inspect it."},
-        {
-            "role": "user",
-            "content": f"Query: {query}\n\nYou have not interacted with the REPL environment or seen your context yet. Your next action should be to look through it. Don't just provide a final answer yet.\n\nThink step-by-step on what to do using the REPL environment (which contains the context) to answer the original query: \"{query}\".\n\nContinue using the REPL environment, which has the `context` variable, and querying sub-LLMs by writing to ```repl``` tags, and determine your answer. Your next action:",
-        },
+    # macOS-specific search directories
+    search_dirs = [
+        Path.cwd(),
+        Path.home(),
+        Path("/tmp"),
+        Path.home() / "Documents",
+        Path.home() / "Downloads",
+        Path.home() / "Desktop",
     ]
 
-    all_iterations = []
-    total_sub_llm_calls = 0
-
-    for iteration_num in range(max_iterations):
-        iter_start = time.perf_counter()
-        
-        if verbose:
-            print(f"\n{'='*80}\nRLM Iteration {iteration_num + 1}/{max_iterations}\n{'='*80}")
-
-        # Manage message history (sliding window)
-        message_history = _manage_message_history(message_history)
-
-        # Get LLM response
-        lm_response = ollama_client.chat(
-            message_history,
-            options={"temperature": 0.7, "num_ctx": Config.ROOT_NUM_CTX},
-        )
-        
-        if "error" in lm_response:
-            return {"error": lm_response["error"], "status": "error"}
-        
-        response_text = lm_response.get("response", "")
-        
-        if verbose:
-            preview = response_text[:500] + "..." if len(response_text) > 500 else response_text
-            print(f"\nLM Response:\n{preview}")
-
-        # Check for final answer
-        final_answer = find_final_answer(response_text, repl_env)
-        if final_answer:
-            if verbose:
-                print(f"\n{'='*80}\nFINAL ANSWER: {final_answer[:200]}...\n{'='*80}")
-
-            return {
-                "answer": final_answer,
-                "iterations": iteration_num + 1,
-                "execution_time": time.perf_counter() - start_time,
-                "code_blocks_executed": sum(len(it.code_blocks) for it in all_iterations),
-                "recursive_llm_calls": total_sub_llm_calls,
-                "status": "success",
-            }
-
-        # Extract and execute code blocks
-        code_blocks = find_code_blocks(response_text)
-        executed_blocks = []
-
-        for code in code_blocks:
-            if verbose:
-                code_preview = code[:200] + "..." if len(code) > 200 else code
-                print(f"\nExecuting code:\n{code_preview}")
-            
-            result = repl_env.execute_code(code)
-            executed_blocks.append((code, result))
-            total_sub_llm_calls += len(repl_env._pending_llm_calls)
-            repl_env._pending_llm_calls = []
-
-            if verbose:
-                output_preview = result.stdout[:200] if result.stdout else "(none)"
-                print(f"Output: {output_preview}")
-                if result.stderr:
-                    print(f"Errors: {result.stderr[:200]}")
-
-        # Record iteration
-        all_iterations.append(RLMIteration(
-            prompt=message_history[-1]["content"],
-            response=response_text,
-            code_blocks=executed_blocks,
-            iteration_time=time.perf_counter() - iter_start,
-        ))
-
-        # Build result summary for next iteration
-        result_parts = []
-        for code, result in executed_blocks:
-            exec_result = format_execution_result(result)
-            composed = f"Code executed:\n```python\n{code}\n```\n\nREPL output:\n{exec_result}"
-            if len(composed) > Config.MAX_RESULT_LENGTH:
-                composed = composed[:Config.MAX_RESULT_LENGTH] + f"... [{len(composed) - Config.MAX_RESULT_LENGTH} chars truncated]"
-            result_parts.append(composed)
-        
-        message_history.append({"role": "user", "content": "\n\n".join(result_parts)})
-
-        # Prompt for next action
-        message_history.append({
-            "role": "user",
-            "content": f"The history before is your previous interactions with the REPL environment. Think step-by-step on what to do using the REPL environment (which contains the context) to answer the original query: \"{query}\".\n\nContinue using the REPL environment, which has the `context` variable, and querying sub-LLMs by writing to ```repl``` tags, and determine your answer. Your next action:"
-        })
-
-    # Max iterations reached
-    if verbose:
-        print(f"\n{'='*80}\nMAX ITERATIONS REACHED — forcing final answer\n{'='*80}")
-
-    message_history.append({
-        "role": "user",
-        "content": "Based on all the information you have, provide a final answer to the user's query."
-    })
-
-    final_response = ollama_client.chat(
-        message_history,
-        options={"temperature": 0.7, "num_ctx": Config.ROOT_NUM_CTX},
-    )
-    
-    final_text = final_response.get("response", "Max iterations reached without answer.")
-
-    return {
-        "answer": final_text,
-        "iterations": max_iterations,
-        "execution_time": time.perf_counter() - start_time,
-        "code_blocks_executed": sum(len(it.code_blocks) for it in all_iterations),
-        "recursive_llm_calls": total_sub_llm_calls,
-        "status": "max_iterations_reached",
-    }
-
-
-# ============================================================================
-# OPTIMIZED OLLAMA CLIENT WITH CONNECTION POOLING
-# ============================================================================
-
-class OllamaClient:
-    """
-    Optimized Ollama client with connection pooling and keep-alive.
-    """
-
-    __slots__ = ['base_url', '_session', '_adapter']
-
-    def __init__(self, base_url: str = None):
-        self.base_url = base_url or Config.OLLAMA_BASE_URL
-        
-        # OPTIMIZATION: Use connection pooling with keep-alive
-        self._session = requests.Session()
-        self._adapter = requests.adapters.HTTPAdapter(
-            pool_connections=10,
-            pool_maxsize=20,
-            max_retries=3,
-        )
-        self._session.mount("http://", self._adapter)
-        self._session.mount("https://", self._adapter)
-        
-        # Set keep-alive headers
-        self._session.headers.update({
-            "Connection": "keep-alive",
-            "Keep-Alive": "timeout=300, max=1000",
-        })
-        
-        self._check_connection()
-
-    def _check_connection(self):
-        """Verify Ollama is running"""
-        try:
-            response = self._session.get(f"{self.base_url}/api/tags", timeout=5)
-            if response.status_code != 200:
-                raise ConnectionError("Ollama is not responding correctly")
-        except requests.exceptions.RequestException as e:
-            raise ConnectionError(
-                f"Cannot connect to Ollama at {self.base_url}\n"
-                f"Make sure Ollama is running: ollama serve\n"
-                f"Error: {str(e)}"
-            )
-
-    def chat(self, messages: list, model: str = None, options: dict = None) -> dict:
-        """Chat completion with connection reuse."""
-        model = model or Config.LLM_MODEL
-        payload = {
-            "model": model,
-            "messages": messages,
-            "stream": False,
-            "options": options or {"temperature": 0.7, "num_ctx": Config.ROOT_NUM_CTX},
-        }
-        try:
-            response = self._session.post(
-                f"{self.base_url}/api/chat", 
-                json=payload, 
-                timeout=Config.DEFAULT_TIMEOUT
-            )
-            response.raise_for_status()
-            result = response.json()
-            return {"response": result.get("message", {}).get("content", "")}
-        except requests.exceptions.RequestException as e:
-            return {"error": f"Ollama chat failed: {str(e)}", "response": ""}
-
-    def list_models(self) -> dict:
-        """List available models with connection reuse."""
-        try:
-            response = self._session.get(f"{self.base_url}/api/tags", timeout=10)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            return {"error": f"Failed to list models: {str(e)}"}
-
-    def close(self):
-        """Close the session and release connections."""
-        self._session.close()
-
-
-# ============================================================================
-# LAZY INITIALIZATION
-# ============================================================================
-
-_ollama_instance = None
-_init_lock = threading.Lock()
-
-
-def get_ollama() -> OllamaClient:
-    """Lazy initialization of Ollama client"""
-    global _ollama_instance
-    with _init_lock:
-        if _ollama_instance is None:
-            _ollama_instance = OllamaClient()
-        return _ollama_instance
-
-
-def reset_ollama():
-    """Reset Ollama instance (useful for reconnection)"""
-    global _ollama_instance
-    with _init_lock:
-        if _ollama_instance:
-            _ollama_instance.close()
-        _ollama_instance = None
-
-
-# ============================================================================
-# FILE PATH RESOLUTION (unchanged, already efficient)
-# ============================================================================
-
-def resolve_file_path(filename: str) -> Path:
-    """Cross-platform file path resolution"""
-    file_path = Path(filename)
-    
-    if file_path.is_absolute():
-        if file_path.exists():
-            return file_path
-        raise FileNotFoundError(f"File not found: {file_path}")
-
-    search_dirs = []
-    system = os.name
-
-    if system == "nt":  # Windows
-        search_dirs = [
-            Path.cwd(),
-            Path.home(),
-            Path(os.environ.get("TEMP", "C:/Temp")),
-            Path("D:/ClaudeDocuments"),
-        ]
-    elif system == "posix":
-        if os.uname().sysname == "Darwin":  # macOS
-            search_dirs = [
-                Path.cwd(), Path.home(), Path("/tmp"),
-                Path.home() / "Documents", Path.home() / "Downloads",
-                Path.home() / "Desktop",
-            ]
-        else:  # Linux
-            search_dirs = [
-                Path.cwd(), Path("/home/claude"), Path("/tmp"),
-                Path("/mnt/user-data/uploads"),
-            ]
-
-    for search_dir in search_dirs:
-        if not search_dir.exists():
-            continue
-        candidate = search_dir / filename
-        if candidate.exists() and candidate.is_file() and os.access(candidate, os.R_OK):
+    for d in search_dirs:
+        candidate = d / filename
+        if candidate.exists() and candidate.is_file():
             return candidate
 
-    searched = "\n  ".join(str(d / filename) for d in search_dirs if d.exists())
     raise FileNotFoundError(
-        f"File '{filename}' not found.\n"
-        f"OS: {system}\n"
-        f"Searched:\n  {searched}\n"
-        f"Tip: Use absolute path or place file in: {Path.cwd()}"
+        f"'{filename}' not found. Searched: {[str(d) for d in search_dirs if d.exists()]}"
     )
 
 
-def read_file_safe(filepath: Path, encoding: str = "utf-8") -> str:
-    """Read file with encoding fallback"""
-    try:
-        with open(filepath, "r", encoding=encoding) as f:
-            return f.read()
-    except UnicodeDecodeError:
-        try:
-            with open(filepath, "r", encoding="latin-1") as f:
-                return f.read()
-        except Exception as e:
-            raise IOError(f"Failed to read file with latin-1 encoding: {e}")
-    except Exception as e:
-        raise IOError(f"Failed to read file {filepath}: {e}")
+# ─── Singleton ────────────────────────────────────────────────────────────────
+
+_session = Session()
 
 
-# ============================================================================
-# CORE RLM IMPLEMENTATION (shared logic)
-# ============================================================================
+# ─── MCP Server & Tools ──────────────────────────────────────────────────────
 
-def _run_rlm(query: str, context: Any, max_iterations: int, verbose: bool) -> dict:
-    """
-    Core RLM implementation — plain function callable by both MCP tool wrappers.
-    """
-    try:
-        ollama_client = get_ollama()
-    except ConnectionError as e:
-        return {"error": f"Ollama not connected: {str(e)}", "status": "error"}
-
-    try:
-        return rlm_completion_loop(
-            query=query,
-            context=context,
-            ollama_client=ollama_client,
-            max_iterations=max_iterations,
-            verbose=verbose,
-        )
-    except Exception as e:
-        return {"error": f"RLM execution failed: {str(e)}", "status": "error"}
-
-
-# ============================================================================
-# MCP SERVER SETUP
-# ============================================================================
-
-mcp = FastMCP("smart-context-rlm")
+mcp = FastMCP("rlm-repl-server")
 
 
 @mcp.tool()
-def rlm_query(
-    query: str,
-    context: str | dict | list,
-    max_iterations: int = 30,
-    verbose: bool = False,
+def load_context(
+    source: str,
+    source_type: str = "file",
+    context_label: str = "text",
 ) -> dict:
     """
-    TRUE RLM: Language model programmatically decomposes task using REPL environment.
-    
-    This implements the pure RLM paradigm from "Recursive Language Models" (arXiv:2512.24601).
-    The document/context is NEVER fed directly to the LLM — it's loaded as a REPL variable.
-    The LLM writes Python code to inspect, chunk, and process it via recursive sub-LLM calls.
-    
-    This breaks context window limits because:
-    - The full document lives in the REPL environment (external to the LLM)
-    - The LLM writes code to slice the document into chunks
-    - Each chunk is processed by a sub-LLM call (within its context window)
-    - Results accumulate in REPL variables, not in the LLM's context
+    Initialize the RLM REPL session with context data.
+
+    This loads context into the REPL as a `context` variable that you (Claude) can
+    inspect and process via repl_execute(). The raw content is NEVER returned to you —
+    you must write Python code to interact with it.
 
     Args:
-        query: User's question or task
-        context: Context data (string, dict, or list) — can be arbitrarily large
-        max_iterations: Maximum reasoning steps (default 30)
-        verbose: Print detailed execution logs (default: False)
+        source: File path (if source_type="file") or raw text content (if source_type="inline").
+        source_type: "file" to read from disk, "inline" to use the source string directly.
+        context_label: Description of what this context is (e.g. "research paper", "chat logs").
 
     Returns:
-        dict with answer, iterations, execution_time, code_blocks_executed,
-        recursive_llm_calls, and status
-
-    Example:
-        result = rlm_query(
-            query="What are the main points?",
-            context=large_document,  # Can be 10MB+ — no context limit!
-            max_iterations=20
-        )
-        print(result["answer"])
+        Session info with context metadata (type, size, available variables).
     """
-    return _run_rlm(query, context, max_iterations, verbose)
+    if source_type == "file":
+        path = _resolve_path(source)
+        content, encoding = _read_file(str(path))
+        info = _session.init_repl(content, context_label)
+        info["file"] = str(path)
+        info["encoding"] = encoding
+        return info
+    elif source_type == "inline":
+        return _session.init_repl(source, context_label)
+    else:
+        return {"error": f"Unknown source_type: {source_type}. Use 'file' or 'inline'."}
 
 
 @mcp.tool()
-def rlm_query_file(
-    query: str,
-    file_path: str,
-    max_iterations: int = 30,
-    verbose: bool = False,
-) -> dict:
+def repl_execute(code: str) -> dict:
     """
-    RLM query with file as context. Reads file then runs the RLM loop.
+    Execute Python code in the RLM REPL environment.
 
-    The file content is loaded into the REPL environment as a variable.
-    The LLM never sees the full file — it writes code to inspect and process it.
-    This works for files of ANY size (tested with 1M+ line documents).
+    The REPL has a persistent `context` variable (loaded via load_context) and any
+    variables you create persist across calls. You also have access to:
+      - llm_query(prompt) → str: Call the sub-LLM with a prompt.
+      - llm_query_batched([prompts]) → [str]: Parallel sub-LLM calls.
+
+    Returns metadata only (variable names, truncated stdout) to keep your context
+    window clean. Write `print(var[:500])` to inspect specific values.
+
+    Strategy guidance (from the paper):
+      1. First inspect: print(len(context)), print(context[:500])
+      2. Decide chunking: by size, by delimiter, by structure
+      3. Process chunks via llm_query or llm_query_batched
+      4. Aggregate results in REPL variables
+      5. You (Claude) provide the final answer directly in conversation — no FINAL() needed.
 
     Args:
-        query: User's question or task about the file
-        file_path: Path to the document (absolute or relative)
-        max_iterations: Maximum reasoning steps (default 30)
-        verbose: Print detailed execution logs
+        code: Python code to execute. Wrap in a single string, not in code fences.
 
     Returns:
-        Same as rlm_query()
+        Dict with stdout (truncated), stderr, variables (names + types + sizes),
+        and execution time. Full stdout length is included so you know if truncation occurred.
     """
-    try:
-        validated_path = resolve_file_path(file_path)
-        content = read_file_safe(validated_path)
-        # Call plain function directly — NOT the MCP tool wrapper (FunctionTool not callable in FastMCP 2.x)
-        return _run_rlm(query, content, max_iterations, verbose)
-    except (FileNotFoundError, PermissionError) as e:
-        return {"error": str(e), "status": "error"}
-    except Exception as e:
-        return {"error": f"Unexpected error: {str(e)}", "status": "error"}
+    if not _session.is_active:
+        return {"error": "No active session. Call load_context() first."}
+    return _session.repl.execute(code)
 
 
 @mcp.tool()
-def check_ollama_status() -> dict:
+def sub_llm_query(prompt: str) -> str:
     """
-    Check if Ollama is running and list available models.
+    Call the sub-LLM directly (outside the REPL).
+
+    Use this when you want a quick sub-LLM response without writing REPL code.
+    For processing context chunks, prefer using llm_query() inside repl_execute()
+    so results stay in REPL variables.
+
+    The sub-LLM is Gemini 2.5 Flash (1M token context) with Qwen3 14B fallback.
+
+    Args:
+        prompt: The prompt to send to the sub-LLM.
 
     Returns:
-        Ollama status and available models
+        The sub-LLM's response text.
     """
-    try:
-        ollama_client = get_ollama()
-    except ConnectionError as e:
-        return {
-            "status": "disconnected",
-            "message": f"Ollama is not running: {str(e)}. Start it with: ollama serve",
-            "configured_llm": Config.LLM_MODEL,
-        }
-
-    try:
-        models_result = ollama_client.list_models()
-        if "error" in models_result:
-            return models_result
-
-        available_models = [m.get("name", m.get("model", "unknown")) 
-                          for m in models_result.get("models", [])]
-        llm_available = any(Config.LLM_MODEL in m for m in available_models)
-
-        return {
-            "status": "connected",
-            "ollama_url": Config.OLLAMA_BASE_URL,
-            "configured_llm": Config.LLM_MODEL,
-            "llm_available": llm_available,
-            "available_models": available_models,
-            "recommendation": f"ollama pull {Config.LLM_MODEL}" if not llm_available else None,
-            "rlm_config": {
-                "root_context_window": Config.ROOT_NUM_CTX,
-                "sub_llm_context_window": Config.SUB_LLM_NUM_CTX,
-                "max_iterations": Config.MAX_ITERATIONS,
-                "max_message_history": Config.MAX_MESSAGE_HISTORY,
-            }
-        }
-    except Exception as e:
-        return {"error": str(e)}
+    return _session.sub_llm.query(prompt)
 
 
 @mcp.tool()
-def clear_cache() -> dict:
+def sub_llm_batch(prompts: list[str]) -> list[str]:
     """
-    Clear the LLM response cache to free memory.
-    
+    Parallel sub-LLM calls (outside the REPL).
+
+    Processes up to 8 prompts concurrently. For batch processing inside the REPL,
+    use llm_query_batched([prompts]) instead.
+
+    Args:
+        prompts: List of prompts to send in parallel.
+
     Returns:
-        Status of cache clear operation
+        List of response strings in the same order.
     """
-    clear_llm_cache()
-    return {"status": "success", "message": "LLM cache cleared"}
+    return _session.sub_llm.query_batch(prompts)
 
 
 @mcp.tool()
-def get_performance_stats() -> dict:
+def get_variable(name: str, max_chars: int = 5000) -> str:
     """
-    Get performance statistics for the RLM implementation.
-    
-    Returns:
-        Performance metrics including cache stats
-    """
-    with _cache_lock:
-        cache_size = len(_llm_cache)
-        cache_timestamps = list(_llm_cache_timestamps.values())
-    
-    return {
-        "cache": {
-            "size": cache_size,
-            "max_size": Config.LLM_CACHE_SIZE,
-            "ttl_seconds": Config.LLM_CACHE_TTL,
-            "hit_ratio": "N/A (not tracked)",
-        },
-        "config": {
-            "llm_model": Config.LLM_MODEL,
-            "root_context": Config.ROOT_NUM_CTX,
-            "sub_llm_context": Config.SUB_LLM_NUM_CTX,
-            "max_iterations": Config.MAX_ITERATIONS,
-        }
-    }
+    Retrieve the string value of a REPL variable.
 
+    Use this to pull a computed result out of the REPL when you need to see it
+    in full (up to max_chars). For very large variables, use repl_execute with
+    slicing instead: print(var[:1000])
+
+    Args:
+        name: Variable name in the REPL.
+        max_chars: Maximum characters to return (default 5000).
+
+    Returns:
+        String representation of the variable, truncated if necessary.
+    """
+    if not _session.is_active:
+        return "Error: No active session."
+    try:
+        val = str(_session.repl.get_var(name))
+        if len(val) > max_chars:
+            return val[:max_chars] + f"\n... [{len(val) - max_chars:,} more chars]"
+        return val
+    except KeyError as e:
+        return str(e)
+
+
+@mcp.tool()
+def session_status() -> dict:
+    """
+    Check the current session state, sub-LLM availability, and usage stats.
+
+    Returns:
+        Session info including active state, context metadata, variables,
+        sub-LLM backend health, and call statistics.
+    """
+    status = _session.status
+    status["sub_llm_health"] = _session.sub_llm.health_check()
+    return status
+
+
+@mcp.tool()
+def reset_session() -> dict:
+    """
+    Destroy the current REPL session and release resources.
+
+    Returns:
+        Confirmation with final session stats.
+    """
+    stats = _session.status
+    if _session.repl:
+        _session.repl.destroy()
+        _session.repl = None
+        _session.context_info = None
+    return {"reset": True, "final_stats": stats}
+
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")

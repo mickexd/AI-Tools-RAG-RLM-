@@ -1,7 +1,7 @@
-# Smart Context Manager — Pure RLM Edition
+# Smart Context Manager — RLM REPL Server
 
 > **Based on:** [Recursive Language Models](https://arxiv.org/abs/2512.24601) (arXiv:2512.24601)
-> **Powered by:** Ollama (local AI) + FastMCP
+> **Architecture:** Claude (root LLM) orchestrates via MCP → Sub-LLMs (OpenRouter/LM Studio) handle processing
 > **Works with:** Claude Desktop, Claude Code, RooCode, OpenCode, and any MCP-compatible client
 
 ---
@@ -27,66 +27,77 @@ Here's the key insight from the research paper:
 ✅ With RLM (infinite context):
    Your chat: [system prompt] + [your question] + [tool call]
                                                         ↓
-                                              MCP Server (Ollama)
+                                              MCP Server (REPL)
                                               document lives HERE
-                                              AI writes code to slice it
-                                              sub-AI calls process chunks
+                                              Claude writes Python to slice it
+                                              Sub-LLM calls process chunks
                                               final answer returned
    Your chat receives: [clean final answer]  ← context window barely touched
 ```
 
 **What this means in practice:**
 
-- Your main AI (Claude, etc.) only sees the **final answer** — not the document
+- Your main AI (Claude) only sees **metadata** — variable names, types, sizes — not the document
 - Your conversation context stays clean and fresh regardless of document size
 - You can analyze a 100MB log file and your chat context barely grows
-- No context rot — the main AI never has to "remember" a huge document
-- Works on files with **millions of lines** (tested in the reference implementation)
+- No context rot — Claude never has to "remember" a huge document
+- Works on files with **millions of lines**
 
 The paper calls this _"unbounded input tokens"_ and _"unbounded semantic horizon"_ — the ability to do arbitrarily complex work over arbitrarily large inputs.
 
 ---
 
-## How It Breaks Context Window Limits
+## Architecture: Claude Orchestrates, Sub-LLMs Process
 
-Most AI tools fail on large documents because they try to feed the entire file into the AI's context window. This tool does something fundamentally different:
+This implementation follows the RLM paradigm where **Claude is the root LLM** that orchestrates everything via MCP tool calls:
 
 ```
-Traditional approach (FAILS on large files):
-  Document (10MB) → AI context window (32K tokens) → OVERFLOW ❌
-
-RLM approach (WORKS on any size):
-  Document (10MB) → REPL variable (external to AI)
-                         ↓
-                    AI sees only: "context is a string, 10MB long"
-                         ↓
-                    AI writes Python code to slice it:
-                    chunks = [context[i:i+15000] for i in range(0, len(context), 15000)]
-                         ↓
-                    Sub-AI calls process each chunk (within window)
-                         ↓
-                    Results accumulate in REPL variables
-                         ↓
-                    Final answer synthesized ✅
+Claude (Root LLM)
+    ↓ calls MCP tools
+┌─────────────────────────────────────────────────────────────┐
+│  smart_context_mcp.py (MCP Server)                          │
+│                                                             │
+│  load_context() → Loads document into REPL variable         │
+│  repl_execute() → Claude writes Python to inspect/process   │
+│       ↓                                                     │
+│  REPLEnvironment                                            │
+│    context = [your document]  ← lives here, not in Claude  │
+│    llm_query()                ← sub-LLM calls               │
+│    llm_query_batched()        ← parallel sub-LLM calls      │
+│       ↓                                                     │
+│  Sub-LLM Client (automatic failover)                        │
+│    Primary: OpenRouter → Gemini 3 Flash (1M context)        │
+│    Fallback: LM Studio → Qwen3 14B (local)                  │
+└─────────────────────────────────────────────────────────────┘
+    ↓
+Claude receives: metadata-only results (variable names, truncated stdout)
+    ↓
+Claude provides final answer in conversation
 ```
 
-The document **never enters the AI's context window directly**. The AI writes code to inspect and process it programmatically — exactly like a programmer would.
+**Key insight:** Claude never sees the raw document. It writes Python code to inspect and process it. Results stay in REPL variables. Only metadata returns to Claude's context.
 
 ---
 
 ## Quick Start (5 Minutes)
 
-### Step 1: Install Ollama
+### Step 1: Get a Sub-LLM Backend
 
-Download from [ollama.com](https://ollama.com/) and install it.
+**Option A: OpenRouter (Recommended — Cloud)**
 
-Then pull the model:
+1. Sign up at [openrouter.ai](https://openrouter.ai/)
+2. Get an API key
+3. Set environment variable: `OPENROUTER_API_KEY=sk-or-v1-...`
 
-```bash
-ollama pull ministral-3:latest
-```
+Uses Gemini 3 Flash (1M token context, fast, cheap) by default.
 
-> You can use any Ollama model. Change `LLM_MODEL` in the `Config` class inside `smart_context_mcp.py` to switch models.
+**Option B: LM Studio (Local — Free)**
+
+1. Download from [lmstudio.ai](https://lmstudio.ai/)
+2. Install a model (e.g., Qwen3 14B)
+3. Start the local server on port 1234
+
+No API key needed — runs entirely offline.
 
 ### Step 2: Install Python Dependencies
 
@@ -104,13 +115,13 @@ Edit: `%APPDATA%\Claude\claude_desktop_config.json`
 ```json
 {
   "mcpServers": {
-    "smart-context": {
+    "rlm-repl": {
       "command": "python",
       "args": [
         "C:/Users/YourName/Path/To/Claude Desktop Windows/RLM + Nomic Text Emebeding/smart_context_mcp.py"
       ],
       "env": {
-        "OLLAMA_NUM_PARALLEL": "1"
+        "OPENROUTER_API_KEY": "sk-or-v1-your-key-here"
       }
     }
   }
@@ -123,13 +134,13 @@ Edit: `~/Library/Application Support/Claude/claude_desktop_config.json`
 ```json
 {
   "mcpServers": {
-    "smart-context": {
+    "rlm-repl": {
       "command": "python3",
       "args": [
         "/Users/YourName/Path/To/Claude Desktop Mac/RLM + Nomic Text Emebeding/smart_context_mcp.py"
       ],
       "env": {
-        "OLLAMA_NUM_PARALLEL": "1"
+        "OPENROUTER_API_KEY": "sk-or-v1-your-key-here"
       }
     }
   }
@@ -138,63 +149,117 @@ Edit: `~/Library/Application Support/Claude/claude_desktop_config.json`
 
 ### Step 4: Restart Your AI Client
 
-After saving the config, restart Claude Desktop (or your AI client). The tool will appear automatically.
+After saving the config, restart Claude Desktop. The tools will appear automatically.
 
 ---
 
-## The Three Tools
+## The Seven Tools
 
-The server exposes exactly **3 tools** — nothing more, nothing less.
+The server exposes **7 tools** for the RLM paradigm:
 
-### `rlm_query` — Ask anything about any data
+### `load_context` — Load document into REPL
 
 ```
-Use rlm_query with:
-- query: "What are the main security vulnerabilities?"
-- context: [paste your code, document, or data here]
+Use load_context with:
+- source: "C:/Users/YourName/Documents/report.txt"
+- source_type: "file"
+- context_label: "research paper"
 ```
 
-| Parameter        | Type                 | Default  | Description                              |
-| ---------------- | -------------------- | -------- | ---------------------------------------- |
-| `query`          | string               | required | Your question or task                    |
-| `context`        | string / dict / list | required | The data to analyze — can be any size    |
-| `max_iterations` | integer              | 30       | How many reasoning steps before stopping |
-| `verbose`        | boolean              | false    | Print detailed logs                      |
+| Parameter       | Type   | Default   | Description                                    |
+| --------------- | ------ | --------- | ---------------------------------------------- |
+| `source`        | string | required  | File path or inline content                    |
+| `source_type`   | string | "file"    | "file" or "inline"                             |
+| `context_label` | string | "text"    | Description of what this context is            |
 
-**Returns:** `answer`, `iterations`, `execution_time`, `code_blocks_executed`, `recursive_llm_calls`, `status`
+**Returns:** Session info with context metadata (type, size, available variables).
 
 ---
 
-### `rlm_query_file` — Ask anything about any file
+### `repl_execute` — Run Python in the REPL
 
 ```
-Use rlm_query_file with:
-- query: "Summarize the main findings"
-- file_path: "C:/Users/YourName/Documents/report.txt"
+Use repl_execute with:
+- code: "print(len(context))\nprint(context[:500])"
 ```
 
-| Parameter        | Type    | Default  | Description                 |
-| ---------------- | ------- | -------- | --------------------------- |
-| `query`          | string  | required | Your question or task       |
-| `file_path`      | string  | required | Path to the file (any size) |
-| `max_iterations` | integer | 30       | Reasoning steps             |
-| `verbose`        | boolean | false    | Detailed logs               |
+| Parameter | Type   | Description                                   |
+| --------- | ------ | --------------------------------------------- |
+| `code`    | string | Python code to execute in the REPL environment |
 
-**File path tips:**
+**Returns:** Dict with stdout (truncated), stderr, variables (names + types + sizes), execution time.
 
-- Use full absolute paths for reliability
-- If you give just a filename, it searches: current directory, home folder, Downloads, Documents, Desktop
-- Works on Windows, macOS, and Linux
+**Available in REPL:**
+- `context` — The loaded document
+- `llm_query(prompt)` — Call sub-LLM with a prompt
+- `llm_query_batched([prompts])` — Parallel sub-LLM calls
 
 ---
 
-### `check_ollama_status` — Verify your setup
+### `sub_llm_query` — Direct sub-LLM call
 
 ```
-Use check_ollama_status
+Use sub_llm_query with:
+- prompt: "Summarize the key points of this text..."
 ```
 
-Returns: connection status, available models, context window config, and install commands if anything is missing.
+| Parameter | Type   | Description              |
+| --------- | ------ | ------------------------ |
+| `prompt`  | string | The prompt to send       |
+
+**Returns:** The sub-LLM's response text.
+
+---
+
+### `sub_llm_batch` — Parallel sub-LLM calls
+
+```
+Use sub_llm_batch with:
+- prompts: ["Analyze chunk 1...", "Analyze chunk 2...", "Analyze chunk 3..."]
+```
+
+| Parameter | Type         | Description                        |
+| --------- | ------------ | ---------------------------------- |
+| `prompts` | list[string] | List of prompts (max 8 concurrent) |
+
+**Returns:** List of response strings in the same order.
+
+---
+
+### `get_variable` — Retrieve REPL variable
+
+```
+Use get_variable with:
+- name: "analysis_result"
+- max_chars: 5000
+```
+
+| Parameter  | Type   | Default | Description                        |
+| ---------- | ------ | ------- | ---------------------------------- |
+| `name`     | string | required| Variable name in the REPL          |
+| `max_chars`| int    | 5000    | Maximum characters to return       |
+
+**Returns:** String representation of the variable.
+
+---
+
+### `session_status` — Check session state
+
+```
+Use session_status
+```
+
+**Returns:** Session info including active state, context metadata, variables, sub-LLM backend health, and call statistics.
+
+---
+
+### `reset_session` — Clear the REPL
+
+```
+Use reset_session
+```
+
+**Returns:** Confirmation with final session stats.
 
 ---
 
@@ -203,103 +268,94 @@ Returns: connection status, available models, context window config, and install
 ### Analyze a Large Document
 
 ```
-Use rlm_query_file with:
-- query: "What are the key findings and recommendations?"
-- file_path: "C:/Users/YourName/Documents/annual_report.txt"
+Use load_context with:
+- source: "C:/Users/YourName/Documents/annual_report.txt"
+- source_type: "file"
+- context_label: "annual report"
 ```
 
-The AI will:
-
-1. Load the file into the REPL environment (not into its context)
-2. Write code to inspect the document structure
-3. Chunk it intelligently and process each chunk via sub-AI calls
-4. Synthesize a final answer from all the results
+Then Claude will:
+1. Inspect the document via `repl_execute`: `print(len(context))`, `print(context[:500])`
+2. Write code to chunk and process it
+3. Use `llm_query_batched()` to process chunks in parallel
+4. Aggregate results in REPL variables
+5. Provide the final answer directly in conversation
 
 ### Search a Codebase
 
 ```
-Use rlm_query_file with:
-- query: "Find all functions that handle authentication and identify potential security issues"
-- file_path: "C:/Projects/myapp/main.py"
+Use load_context with:
+- source: "C:/Projects/myapp/main.py"
+- source_type: "file"
+- context_label: "source code"
 ```
+
+Then ask Claude: "Find all functions that handle authentication and identify potential security issues"
 
 ### Analyze Log Files
 
 ```
-Use rlm_query_file with:
-- query: "Find all ERROR and EXCEPTION entries, group them by type, and identify the most frequent issues"
-- file_path: "C:/Logs/app.log"
+Use load_context with:
+- source: "C:/Logs/app.log"
+- source_type: "file"
+- context_label: "application logs"
 ```
 
-### Process Structured Data
-
-```
-Use rlm_query with:
-- query: "Which customers have the highest lifetime value and what do they have in common?"
-- context: [paste CSV data or JSON here]
-```
+Then ask Claude: "Find all ERROR and EXCEPTION entries, group them by type, and identify the most frequent issues"
 
 ### Needle in a Haystack
 
 ```
-Use rlm_query_file with:
-- query: "Find the magic number hidden in this file"
-- file_path: "C:/Data/million_lines.txt"
-- max_iterations: 15
+Use load_context with:
+- source: "C:/Data/million_lines.txt"
+- source_type: "file"
 ```
 
-The AI will write code to scan the file in chunks, find the relevant line, and return the answer — even if the file has 1 million lines.
+Then ask Claude: "Find the magic number hidden in this file"
+
+Claude will write code to scan the file in chunks, find the relevant line, and return the answer — even if the file has 1 million lines.
 
 ---
 
 ## What Happens Inside the RLM Loop
 
-When you call `rlm_query` or `rlm_query_file`, this is what happens:
+When you load context and ask a question, this is what happens:
 
-````
+```
 1. Your document is loaded into a REPL variable called `context`
    (for files >100KB, written to a temp file and loaded via file I/O)
 
-2. The root AI sees only metadata:
-   "Context type: str, length: 5242880 chars (~1310720 tokens)"
+2. Claude sees only metadata:
+   "Context loaded: 5,242,880 chars, available as 'context' variable"
 
-3. The AI writes Python code in ```repl blocks:
-   ```repl
+3. Claude writes Python code via repl_execute():
+   
    # Inspect the document
    print(len(context))
    print(context[:500])  # Preview first 500 chars
-````
 
-4. The code runs in a sandboxed Python environment
+4. Claude sees the output and writes more code:
 
-5. The AI sees the output and writes more code:
-
-   ```repl
    # Chunk and process in parallel
    chunk_size = 15000
    chunks = [context[i:i+chunk_size] for i in range(0, len(context), chunk_size)]
-
+   
    # Screen chunks for relevance (runs all concurrently)
    results = llm_query_batched([
        f"Does this contain information about X? Reply YES/NO: {chunk}"
        for chunk in chunks
    ])
    relevant = [chunks[i] for i, r in enumerate(results) if "YES" in r]
-   ```
 
-6. Sub-AI calls (llm_query / llm_query_batched) process each chunk
-   within their own context window
+5. Sub-LLM calls (llm_query / llm_query_batched) process each chunk
+   within their own context window (1M tokens for Gemini)
 
-7. Results accumulate in REPL variables
+6. Results accumulate in REPL variables
 
-8. When done, the AI signals completion:
-   FINAL(Here is my answer based on the analysis...)
-   or
-   FINAL_VAR(final_answer) ← returns a variable from the REPL
+7. Claude provides the final answer directly in conversation
+```
 
-````
-
-The message history uses a **sliding window** (last 20 messages) to prevent the root AI's context from overflowing during long analysis sessions.
+**Key difference from the old approach:** Claude provides the answer directly — no `FINAL()` or `FINAL_VAR()` needed. The REPL is just for processing.
 
 ---
 
@@ -315,12 +371,6 @@ The message history uses a **sliding window** (last 20 messages) to prevent the 
 | **OpenCode** | ✅ Full | Add to OpenCode's MCP server configuration |
 | **Any MCP client** | ✅ Full | Any client implementing the MCP standard works |
 
-The RLM reasoning happens **inside the MCP server** (in Ollama), not inside the AI client. The client just calls the tool and gets back the final answer. This means:
-
-- The client's own context window is **not consumed** by the document analysis
-- The tool works the same regardless of which client calls it
-- You can use a small-context client (like a mobile app) to analyze million-line files
-
 ---
 
 ## Configuration
@@ -329,27 +379,42 @@ Edit the `Config` class at the top of `smart_context_mcp.py`:
 
 ```python
 class Config:
-    OLLAMA_BASE_URL = "http://localhost:11434"
-    LLM_MODEL = "ministral-3:latest"    # Change to any Ollama model
+    # Primary sub-LLM: OpenRouter → Gemini 3 Flash
+    OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+    OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "your-key-here")
+    OPENROUTER_MODEL = os.environ.get("RLM_SUB_MODEL", "google/gemini-3-flash-preview")
 
-    # Context window sizes
-    ROOT_NUM_CTX = 32768    # Root AI: needs room for system prompt + history
-    SUB_LLM_NUM_CTX = 24576 # Sub-AI: processes individual document chunks
+    # Fallback sub-LLM: LM Studio → Qwen3 14B (local)
+    LMSTUDIO_BASE_URL = os.environ.get("LMSTUDIO_BASE_URL", "http://localhost:1234/v1")
+    LMSTUDIO_MODEL = os.environ.get("LMSTUDIO_MODEL", "qwen/qwen3-14b")
 
-    # RLM loop limits
-    MAX_ITERATIONS = 30          # Max reasoning steps per query
-    MAX_MESSAGE_HISTORY = 20     # Sliding window size (prevents root overflow)
-    MAX_RESULT_LENGTH = 100000   # Max chars per REPL output fed back to root AI
-````
+    # Sub-LLM parameters
+    SUB_LLM_TEMPERATURE = 0.3
+    SUB_LLM_MAX_TOKENS = 16384
+    SUB_LLM_TIMEOUT = 120
 
-**Recommended models (Ollama):**
+    # REPL output limits
+    STDOUT_PREVIEW_CHARS = 500
+    STDERR_PREVIEW_CHARS = 300
+    MAX_BATCH_WORKERS = 8
+```
 
-| Model                | Size | Best For                          |
-| -------------------- | ---- | --------------------------------- |
-| `ministral-3:latest` | ~3GB | Default — fast, good reasoning    |
-| `llama3.2:latest`    | ~2GB | Lighter, faster                   |
-| `qwen2.5:14b`        | ~9GB | Better reasoning, needs more VRAM |
-| `deepseek-r1:8b`     | ~5GB | Strong code analysis              |
+**Recommended OpenRouter models:**
+
+| Model                       | Context  | Best For                          |
+| --------------------------- | -------- | --------------------------------- |
+| `google/gemini-3-flash-preview` | 1M tokens | Default — fast, huge context      |
+| `anthropic/claude-3-haiku`  | 200K     | Fast, high quality                |
+| `openai/gpt-4o-mini`        | 128K     | Good balance                      |
+| `meta-llama/llama-3.1-70b-instruct` | 128K | Open source option            |
+
+**LM Studio models (local):**
+
+| Model                | Size  | Best For                          |
+| -------------------- | ----- | --------------------------------- |
+| `qwen3-14b`          | ~9GB  | Default — good reasoning          |
+| `llama-3.2-3b`       | ~2GB  | Lighter, faster                   |
+| `deepseek-r1-8b`     | ~5GB  | Strong code analysis              |
 
 ---
 
@@ -358,32 +423,26 @@ class Config:
 | Component               | Minimum       | Recommended |
 | ----------------------- | ------------- | ----------- |
 | **Python**              | 3.10+         | 3.12+       |
-| **RAM**                 | 8 GB          | 16 GB+      |
-| **VRAM (GPU)**          | 4 GB          | 8 GB+       |
-| **Mac (Apple Silicon)** | 16 GB unified | 24 GB+      |
-| **Storage**             | 5 GB          | 10 GB+      |
-| **Ollama**              | Any version   | Latest      |
+| **RAM**                 | 4 GB          | 8 GB+       |
+| **Internet**            | Required for OpenRouter | Optional (LM Studio works offline) |
 
-> **CPU-only:** Ollama works on CPU but is much slower. For large documents with many sub-AI calls, expect 5–30 minutes per query on CPU.
+> **Note:** This version uses cloud-based OpenRouter by default, so no local GPU needed. For offline use, configure LM Studio with a local model.
 
 ---
 
 ## Troubleshooting
 
-### "Ollama not connected"
+### "No backends available"
 
 ```bash
-# Start Ollama
-ollama serve
+# Option 1: Set OpenRouter API key
+export OPENROUTER_API_KEY=sk-or-v1-your-key-here
 
-# Check it's running
-ollama list
-
-# Install the model if missing
-ollama pull ministral-3:latest
+# Option 2: Start LM Studio
+# Open LM Studio, load a model, start the server on port 1234
 ```
 
-Then verify: `Use check_ollama_status`
+Then verify: `Use session_status`
 
 ---
 
@@ -397,30 +456,16 @@ Use the **full absolute path**:
 
 ---
 
-### AI keeps hitting max iterations without finishing
+### Sub-LLM calls are slow
 
-The document may be too large for the default settings. Try:
+For OpenRouter: This depends on the model and current load. Gemini Flash is typically fast.
 
-```
-Use rlm_query_file with:
-- query: "Summarize this document"
-- file_path: "your_file.txt"
-- max_iterations: 50    ← increase this
-```
-
-Or ask a more specific question to reduce the scope of analysis.
-
----
-
-### Sub-AI calls are slow
-
-This is normal for large documents — each `llm_query_batched` call runs multiple Ollama requests concurrently. Performance depends on your hardware.
+For LM Studio: Performance depends on your hardware.
 
 To speed up:
-
-1. Use a smaller/faster model (e.g., `llama3.2:latest`)
-2. Increase `SUB_LLM_NUM_CTX` to process larger chunks (fewer total calls)
-3. Use a GPU — CPU inference is 10–50x slower
+1. Use a faster model (Gemini Flash, GPT-4o-mini)
+2. Increase `SUB_LLM_MAX_TOKENS` to process larger chunks (fewer total calls)
+3. Use GPU for LM Studio — CPU inference is 10–50x slower
 
 ---
 
@@ -428,40 +473,6 @@ To speed up:
 
 ```bash
 pip install fastmcp requests
-```
-
----
-
-## Architecture
-
-```
-Your Question
-     ↓
-AI Client (Claude Desktop / RooCode / OpenCode / etc.)
-     ↓ calls MCP tool
-┌─────────────────────────────────────────────────────────┐
-│  smart_context_mcp.py (MCP Server)                      │
-│                                                         │
-│  rlm_query / rlm_query_file                             │
-│       ↓                                                 │
-│  REPLEnvironment                                        │
-│    context = [your document]  ← lives here, not in AI  │
-│    llm_query()                ← sub-AI calls            │
-│    llm_query_batched()        ← parallel sub-AI calls   │
-│       ↓                                                 │
-│  rlm_completion_loop (Algorithm 1 from the paper)       │
-│    Root AI ← sees only metadata about context           │
-│    Root AI → writes Python code                         │
-│    REPL executes code                                   │
-│    Sub-AI calls process chunks                          │
-│    Results accumulate in REPL variables                 │
-│    Repeat until FINAL() or FINAL_VAR()                  │
-│       ↓                                                 │
-│  Ollama (local AI, no internet)                         │
-│    ministral-3:latest (or any model you choose)         │
-└─────────────────────────────────────────────────────────┘
-     ↓
-Final Answer returned to your AI client
 ```
 
 ---
@@ -475,7 +486,7 @@ The repository also includes two additional MCP servers in the `RAG (LanceDB)` f
 | `document_rag_server.py` | Upload PDFs/DOCX/XLSX, hybrid search with citations | LanceDB + sentence-transformers |
 | `lancedb_memory.py`      | Persistent conversation memory across sessions      | LanceDB + sentence-transformers |
 
-These servers use **sentence-transformers** (not Ollama) and run entirely on CPU. They do not use the RLM approach — they use traditional RAG (Retrieval-Augmented Generation) with vector embeddings.
+These servers use **sentence-transformers** (not sub-LLMs) and run entirely on CPU. They use traditional RAG (Retrieval-Augmented Generation) with vector embeddings.
 
 **To use them, install additional dependencies:**
 
@@ -486,52 +497,27 @@ pip install lancedb sentence-transformers torch pyarrow pandas
 pip install PyPDF2 python-docx openpyxl python-pptx rank-bm25 nltk langchain-text-splitters
 ```
 
-**Add to your config:**
-
-```json
-{
-  "mcpServers": {
-    "smart-context": {
-      "command": "python",
-      "args": ["...path.../smart_context_mcp.py"],
-      "env": { "OLLAMA_NUM_PARALLEL": "1" }
-    },
-    "memory": {
-      "command": "python",
-      "args": ["...path.../RAG (LanceDB)/lancedb_memory.py"]
-    },
-    "documents": {
-      "command": "python",
-      "args": ["...path.../RAG (LanceDB)/document_rag_server.py"]
-    }
-  }
-}
-```
-
 ---
 
 ## FAQ
 
 **Q: Does my data leave my machine?**  
-A: No. Ollama runs entirely locally. No data is sent to any external service.
+A: With OpenRouter, yes — prompts are sent to the cloud API. With LM Studio, no — everything runs locally.
 
 **Q: How large a file can it handle?**  
-A: There is no hard limit. The reference implementation (rlm-minimal) was tested with 1 million line files. The document lives in the REPL environment, not in the AI's context window.
+A: There is no hard limit. The document lives in the REPL environment, not in Claude's context window. Files with millions of lines work fine.
 
 **Q: Do I need to know Python?**  
-A: No. The AI writes the Python code internally. You just ask questions in plain language.
+A: No. Claude writes the Python code internally. You just ask questions in plain language.
 
-**Q: Can I use a different model than `ministral-3:latest`?**  
-A: Yes. Edit `LLM_MODEL` in the `Config` class. Any model available in Ollama works.
+**Q: Can I use a different sub-LLM model?**  
+A: Yes. Set `RLM_SUB_MODEL` environment variable for OpenRouter, or `LMSTUDIO_MODEL` for LM Studio.
 
-**Q: Why only 3 tools? The old version had 16+.**  
-A: The extra tools (semantic search, embeddings, vector store, etc.) were not part of the RLM paradigm from the research paper. They added complexity and dependencies without improving the core capability. The pure RLM approach — just `rlm_query`, `rlm_query_file`, and `check_ollama_status` — is simpler, more reliable, and handles larger documents.
+**Q: What's the difference between this and the old Ollama-based version?**  
+A: This version uses Claude as the root LLM (via MCP) and sub-LLMs for processing. The old version ran everything in Ollama. This approach is more flexible — you can use any MCP-compatible client as the root LLM.
 
 **Q: Is the REPL sandboxed?**  
-A: Yes. The REPL blocks `eval`, `exec`, `compile`, `input`, `globals`, and `locals`. Standard library imports and file access are allowed (needed for the AI to read document chunks).
-
-**Q: What if the AI doesn't finish in `max_iterations`?**  
-A: The loop forces a final answer from the AI after max iterations are reached. You can increase `max_iterations` for complex tasks.
+A: Yes. The REPL blocks `eval`, `exec`, `compile`, `input`, `globals`, and `locals`. Standard library imports and file access are allowed.
 
 ---
 
@@ -548,4 +534,4 @@ Reference implementation: [github.com/alexzhang13/rlm](https://github.com/alexzh
 
 ---
 
-_Runs entirely on your local machine. No cloud, no subscriptions, no data leaving your device._
+_Runs with cloud APIs (OpenRouter) or entirely locally (LM Studio). Choose based on your privacy and offline needs._
